@@ -240,6 +240,34 @@ if [ -n "${Z2M_URL:-}" ]; then
 fi
 
 # ==============================================================================
+# ESPHome (manual only - there is no Supervisor to discover the ESPHome
+# add-on and mint it a Home Assistant Ingress session from). Point this at
+# your own ESPHome dashboard directly, e.g. the official esphome/esphome
+# Docker image's dashboard - it is reached with no Ingress in front of it at
+# all, so all 21 esphome_* MCP tools talk to it straight over its own
+# WebSocket API. ESPHOME_USERNAME/PASSWORD are only needed if that dashboard
+# was started with --username/--password; they carry HTTP Basic Auth, since
+# a plain ESPHome dashboard has no idea what a Home Assistant token is.
+# ==============================================================================
+
+if [ -n "${ESPHOME_URL:-}" ]; then
+    case "${ESPHOME_URL}" in
+        http://*|https://*) ;;
+        *)
+            ESPHOME_URL="http://${ESPHOME_URL}"
+            log_info "ESPHOME_URL missing scheme; defaulting to ${ESPHOME_URL}"
+            ;;
+    esac
+    printf 'export ESPHOME_URL=%q\n' "${ESPHOME_URL}" >> "${ENV_VARS_FILE}"
+    log_info "ESPHome dashboard URL configured: ${ESPHOME_URL}"
+    if [ -n "${ESPHOME_USERNAME:-}" ]; then
+        printf 'export ESPHOME_USERNAME=%q\n' "${ESPHOME_USERNAME}" >> "${ENV_VARS_FILE}"
+        printf 'export ESPHOME_PASSWORD=%q\n' "${ESPHOME_PASSWORD:-}" >> "${ENV_VARS_FILE}"
+    fi
+    chmod 600 "${ENV_VARS_FILE}"
+fi
+
+# ==============================================================================
 # Export screenshot_enabled flag for the MCP server
 # ==============================================================================
 

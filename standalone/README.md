@@ -60,17 +60,38 @@ equivalent and is disabled rather than faked:
 - **The inbound MCP-over-Ingress bridge** (`ha_mcp_server_enabled` in the
   add-on) — it depends on Home Assistant Core's Ingress session headers,
   which don't exist without Supervisor. Not present in this build.
-- **ESPHome's web UI reached through Home Assistant Ingress** — minting that
-  session requires Supervisor. ESPHome device/YAML management tools that talk
-  to Home Assistant Core directly should still work with `HA_ACCESS_TOKEN`
-  set, but this path is untested standalone; please file an issue with
-  specifics if you rely on it.
-- **Automatic Zigbee2MQTT/ESPHome discovery** — the add-on finds these by
-  asking Supervisor which add-ons are installed. Standalone, set `Z2M_URL`
-  yourself; there's no equivalent for ESPHome discovery.
-- **`hab` and `zigporter` CLIs** now point at `HA_URL`/`HA_ACCESS_TOKEN`
-  directly instead of the Supervisor proxy. This should work but has seen
-  less testing than the Supervisor path — let us know if something's off.
+
+### Zigbee2MQTT and ESPHome work standalone, just configured directly
+
+The add-on finds these by asking Supervisor which add-ons are installed and,
+for ESPHome, minting it a Home Assistant Ingress session. There's no
+Supervisor to ask standalone, so instead you point straight at them:
+
+- **Zigbee2MQTT**: set `Z2M_URL` to your Z2M instance's own address (e.g.
+  `http://192.168.1.20:8080`). The `zigporter_run` MCP tool and the
+  `zigporter` CLI (rename, inspect, mesh mapping, stale-device cleanup) both
+  use it directly — this needs no Home Assistant token at all.
+- **ESPHome**: set `ESPHOME_URL` to your ESPHome dashboard's own address —
+  most standalone setups run it as its own container (the official
+  `esphome/esphome` image) rather than as an HA add-on, so this is normally
+  simpler than the add-on's path, not a downgrade from it. All 21 `esphome_*`
+  MCP tools (list, compile, upload, logs, secrets, firmware, pairing, etc.)
+  and the `hab esphome` CLI subcommand then talk to that dashboard's
+  WebSocket API directly, with no Home Assistant Ingress involved. If that
+  dashboard requires a login (started with `--username`/`--password`), set
+  `ESPHOME_USERNAME`/`ESPHOME_PASSWORD` too — a plain ESPHome dashboard has
+  no idea what an HA access token is, so `HA_ACCESS_TOKEN` alone won't
+  authenticate to it.
+  - If you *do* still run ESPHome as a Home Assistant add-on reached only
+    through Ingress (no direct port of its own), leave `ESPHOME_URL` unset
+    and set `HA_ACCESS_TOKEN` instead — but that path needs Supervisor
+    internals this build doesn't have, so it's expected not to work; please
+    file an issue with specifics if you're in this situation.
+- **`hab` and `zigporter` CLIs** more generally now point at
+  `HA_URL`/`HA_ACCESS_TOKEN` directly instead of the Supervisor proxy for
+  everything else they do (entities, areas, dashboards, backups). This
+  should work but has seen less testing than the Supervisor path — let us
+  know if something's off.
 
 Everything else — config editing/validation with backup/restore, entity and
 service tools, LSP YAML completion, screenshots, decision notes, home
@@ -89,7 +110,8 @@ standalone as the default terminal path. Please report issues.
 See [`.env.example`](.env.example) for the full, commented list — it mirrors
 the add-on's Configuration tab options section by section. A few standalone-only
 ones: `HA_URL`, `HA_ACCESS_TOKEN`, `HA_VERIFY_SSL`, `FRONTDOOR_PORT`,
-`WEB_USERNAME`/`WEB_PASSWORD`, `HA_CONFIG_DIR`, `BUILD_ARCH`.
+`WEB_USERNAME`/`WEB_PASSWORD`, `HA_CONFIG_DIR`, `BUILD_ARCH`,
+`ESPHOME_URL`/`ESPHOME_USERNAME`/`ESPHOME_PASSWORD`.
 
 `SERIAL_DEVICES` and any bind mount beyond the config directory (`/addons`,
 `/addon_configs`) also need the matching `devices:`/`volumes:` entry in

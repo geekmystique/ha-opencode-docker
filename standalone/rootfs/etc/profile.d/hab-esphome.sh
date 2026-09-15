@@ -1,15 +1,16 @@
-# Wrapper for hab: show a clear error when ESPHome commands are used
-# without a configured access token, instead of letting hab fail cryptically.
+# Wrapper for hab: show a clear error when ESPHome commands are used without
+# either an HA access token or a direct ESPHome connection configured,
+# instead of letting hab fail cryptically.
 hab() {
-    if [ "$1" = "esphome" ] && [ -z "$HA_ACCESS_TOKEN" ]; then
-        echo "Error: ESPHome tools require a Long-Lived Access Token." >&2
+    if [ "$1" = "esphome" ] && [ -z "$HA_ACCESS_TOKEN" ] && [ -z "$ESPHOME_URL" ]; then
+        echo "Error: ESPHome tools need either HA_ACCESS_TOKEN or ESPHOME_URL configured." >&2
         echo "" >&2
-        echo "To configure:" >&2
-        echo "  1. Go to your Home Assistant Profile page (click your user icon)" >&2
-        echo "  2. Scroll to Long-Lived Access Tokens and create one" >&2
-        echo "  3. Go to Settings -> Add-ons -> OpenCode -> Configuration" >&2
-        echo "  4. Paste the token into the 'access_token' field" >&2
-        echo "  5. Restart the OpenCode add-on (with ESPHome already running)" >&2
+        echo "Easiest: set ESPHOME_URL to your ESPHome dashboard's own address" >&2
+        echo "  (e.g. http://esphome:6052), then restart the container." >&2
+        echo "" >&2
+        echo "Or set HA_ACCESS_TOKEN (a Long-Lived Access Token from your Home" >&2
+        echo "  Assistant profile page), if ESPHome runs as an HA add-on you reach" >&2
+        echo "  through Home Assistant Ingress - not the common standalone setup." >&2
         return 1
     fi
     command hab "$@"

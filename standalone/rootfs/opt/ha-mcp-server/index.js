@@ -183,6 +183,26 @@ const HAS_SUPERVISOR = Boolean(process.env.SUPERVISOR_TOKEN);
 // pointed at the real Core URL, see standalone/README.md) still works.
 const HA_ACCESS_TOKEN = process.env.HA_ACCESS_TOKEN;
 const SUPERVISOR_TOKEN = process.env.SUPERVISOR_TOKEN || HA_ACCESS_TOKEN;
+
+// Direct ESPHome connection (standalone only): when set, ESPHome tools talk
+// to this URL directly instead of discovering the ESPHome add-on through
+// Supervisor and minting a Home Assistant Ingress session for it - there is
+// no Supervisor to discover it from, and a standalone ESPHome dashboard
+// (e.g. the official esphome/esphome image) is reached directly on its own
+// port, with no Ingress in front of it at all. Optional HTTP Basic Auth
+// covers a dashboard started with --username/--password; it has no idea what
+// a Home Assistant bearer token or ingress session cookie is.
+const ESPHOME_URL = (process.env.ESPHOME_URL || "").replace(/\/+$/, "");
+const ESPHOME_USERNAME = process.env.ESPHOME_USERNAME || "";
+const ESPHOME_PASSWORD = process.env.ESPHOME_PASSWORD || "";
+const ESPHOME_CONFIGURED = Boolean(HA_ACCESS_TOKEN) || Boolean(ESPHOME_URL);
+
+function esphomeDirectAuthHeaders() {
+  if (ESPHOME_URL && ESPHOME_USERNAME && ESPHOME_PASSWORD) {
+    return { Authorization: `Basic ${Buffer.from(`${ESPHOME_USERNAME}:${ESPHOME_PASSWORD}`).toString("base64")}` };
+  }
+  return {};
+}
 const HA_NATIVE_MCP_API_ID = normalizeNativeMcpApiId(
   process.env.HA_NATIVE_MCP_API_ID ?? NATIVE_MCP_ASSIST_API_ID,
   { allowBaseEndpoint: true }
@@ -190,14 +210,15 @@ const HA_NATIVE_MCP_API_ID = normalizeNativeMcpApiId(
 const MCP_TOOL_PROFILE = normalizeToolProfile(process.env.OPENCODE_MCP_TOOL_PROFILE);
 const NATIVE_HA_MCP_BRIDGE_ENABLED = process.env.OPENCODE_NATIVE_HA_MCP_ENABLED === "true";
 
-// Clear error message when ESPHome tools are used without an access token
-const ESPHOME_TOKEN_ERROR = "ESPHome tools require a Long-Lived Access Token.\n\n" +
-  "To configure:\n" +
+// Clear error message when ESPHome tools are used without a way to reach
+// ESPHome configured (either path below satisfies ESPHOME_CONFIGURED).
+const ESPHOME_TOKEN_ERROR = "ESPHome tools need either ESPHOME_URL or a Long-Lived Access Token configured.\n\n" +
+  "Easiest (standalone, ESPHome running as its own container): set ESPHOME_URL to " +
+  "your ESPHome dashboard's own address (e.g. http://esphome:6052) and restart.\n\n" +
+  "Or (ESPHome reached through Home Assistant Ingress as an HA add-on):\n" +
   "1. Go to your Home Assistant Profile page (click your user icon)\n" +
   "2. Scroll to Long-Lived Access Tokens and create one\n" +
-  "3. Go to Settings â†’ Add-ons â†’ OpenCode â†’ Configuration\n" +
-  "4. Paste the token into the 'access_token' field\n" +
-  "5. Restart the OpenCode add-on (with ESPHome already running)";
+  "3. Set HA_ACCESS_TOKEN to that token and restart (with ESPHome already running)";
 
 // Decision notes: the durable "why" behind this installation's configuration.
 // Recorded only with the user's explicit approval; see lib/decision-notes.js.
@@ -1093,6 +1114,21 @@ let esphomeCache = { result: null, fetchedAt: 0 };
 const ESPHOME_CACHE_TTL = 300000; // 5 minutes â€” well within ingress session lifetime
 
 async function getESPHomeConnection() {
+  // Standalone direct mode: skip Supervisor add-on discovery and the Home
+  // Assistant Ingress session dance entirely - there is nothing to discover.
+  if (ESPHOME_URL) {
+    return {
+      ok: true,
+      slug: "esphome",
+      name: "ESPHome",
+      url: ESPHOME_URL,
+      ingressSession: null,
+      state: "started",
+      version: null,
+      diagnostics: { mode: "direct", url: ESPHOME_URL },
+    };
+  }
+
   const now = Date.now();
   if (esphomeCache.result?.ok && (now - esphomeCache.fetchedAt) < ESPHOME_CACHE_TTL) {
     return esphomeCache.result;
@@ -1109,7 +1145,7 @@ function invalidateESPHomeCache() {
 }
 
 async function withESPHomeDeviceBuilder(operation) {
-  if (!HA_ACCESS_TOKEN) throw new Error(ESPHOME_TOKEN_ERROR);
+  if (!ESPHOME_CONFIGURED) throw new Error(ESPHOME_TOKEN_ERROR);
 
   const esphome = await getESPHomeConnection();
   if (!esphome.ok) throw new Error(`ESPHome discovery failed: ${esphome.error}`);
@@ -1119,7 +1155,10 @@ async function withESPHomeDeviceBuilder(operation) {
   const client = new ESPHomeDeviceBuilderClient({
     baseUrl: esphome.url,
     ingressSession: esphome.ingressSession,
-    token: HA_ACCESS_TOKEN,
+    // A direct standalone connection has no HA bearer token to offer -
+    // esphomeDirectAuthHeaders() carries HTTP Basic Auth instead, if configured.
+    token: ESPHOME_URL ? "" : HA_ACCESS_TOKEN,
+    extraHeaders: esphomeDirectAuthHeaders(),
   });
   let result;
   try {
@@ -1148,7 +1187,8 @@ async function sanitizeLegacyESPHomeOutput(esphome, text, fallback) {
   const client = new ESPHomeDeviceBuilderClient({
     baseUrl: esphome.url,
     ingressSession: esphome.ingressSession,
-    token: HA_ACCESS_TOKEN,
+    token: ESPHOME_URL ? "" : HA_ACCESS_TOKEN,
+    extraHeaders: esphomeDirectAuthHeaders(),
   });
   try {
     return await sanitizeESPHomeResultWithSecrets(client, text);
@@ -1253,14 +1293,17 @@ async function streamESPHomeLogs(baseUrl, endpoint, params, onLine = null, timeo
     
     // Pass ingress session cookie + Bearer token in the WebSocket upgrade handshake.
     // HA Core's ingress proxy requires the Bearer token for auth; the Supervisor
-    // ingress handler requires the session cookie.
+    // ingress handler requires the session cookie. A direct standalone connection
+    // has neither - esphomeDirectAuthHeaders() carries HTTP Basic Auth instead,
+    // if configured, and never sends the HA token to a dashboard that isn't HA.
     const wsOptions = { headers: {} };
     if (ingressSession) {
       wsOptions.headers["Cookie"] = `ingress_session=${ingressSession}`;
     }
-    if (HA_ACCESS_TOKEN) {
+    if (HA_ACCESS_TOKEN && !ESPHOME_URL) {
       wsOptions.headers["Authorization"] = `Bearer ${HA_ACCESS_TOKEN}`;
     }
+    Object.assign(wsOptions.headers, esphomeDirectAuthHeaders());
     
     const ws = new WebSocket(wsUrl, wsOptions);
     
@@ -1336,9 +1379,10 @@ async function getESPHomeDevices(esphomeUrl, ingressSession = null) {
   }
   // When routing through HA Core's ingress proxy, the Bearer token is
   // required for HA Core auth; the cookie is for the Supervisor's ingress.
-  if (HA_ACCESS_TOKEN) {
+  if (HA_ACCESS_TOKEN && !ESPHOME_URL) {
     headers["Authorization"] = `Bearer ${HA_ACCESS_TOKEN}`;
   }
+  Object.assign(headers, esphomeDirectAuthHeaders());
   const url = `${esphomeUrl}/devices`;
   sendLog("debug", "esphome", { action: "get_devices", url, hasSession: !!ingressSession, hasToken: !!HA_ACCESS_TOKEN });
   const response = await fetch(url, { headers, signal: AbortSignal.timeout(API_TIMEOUT_MS) });
@@ -6772,8 +6816,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "esphome_compile": {
         const { device } = args;
         sendLog("info", "esphome", { action: "compile", device });
-        
-        if (!HA_ACCESS_TOKEN) {
+
+        if (!ESPHOME_CONFIGURED) {
           throw new Error(ESPHOME_TOKEN_ERROR);
         }
         
@@ -6845,8 +6889,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "esphome_upload": {
         const { device, port } = args;
         sendLog("info", "esphome", { action: "upload", device, port });
-        
-        if (!HA_ACCESS_TOKEN) {
+
+        if (!ESPHOME_CONFIGURED) {
           throw new Error(ESPHOME_TOKEN_ERROR);
         }
         
@@ -7065,17 +7109,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         
         // For esphome subcommands, pre-discover the ESPHome ingress URL so
         // hab can skip its own (broken direct-connection) discovery and route
-        // through the Supervisor ingress proxy instead.
+        // through the Supervisor ingress proxy instead. In standalone direct
+        // mode (ESPHOME_URL set) there is no ingress session to begin with -
+        // hab gets the plain URL and nothing else.
         let esphomeEnv = {};
         if (lowerCmd.startsWith("esphome ") || lowerCmd === "esphome") {
-          if (!HA_ACCESS_TOKEN) {
+          if (!ESPHOME_CONFIGURED) {
             throw new Error(ESPHOME_TOKEN_ERROR);
           }
           try {
             const esphome = await getESPHomeConnection();
-            if (esphome.ok && esphome.url && esphome.ingressSession) {
+            if (esphome.ok && esphome.url && (esphome.ingressSession || ESPHOME_URL)) {
               esphomeEnv.HAB_ESPHOME_URL = esphome.url;
-              esphomeEnv.HAB_ESPHOME_SESSION = esphome.ingressSession;
+              if (esphome.ingressSession) esphomeEnv.HAB_ESPHOME_SESSION = esphome.ingressSession;
             } else if (!esphome.ok) {
               sendLog("warning", "hab", {
                 action: "esphome_prediscovery_failed",

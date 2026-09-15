@@ -37,10 +37,15 @@ export function buildDeviceBuilderWebSocketUrl(baseUrl) {
 }
 
 export class ESPHomeDeviceBuilderClient {
-  constructor({ baseUrl, ingressSession = "", token = "", timeoutMs = 30000, WebSocketImpl = WebSocket }) {
+  // extraHeaders lets a caller override/add headers beyond the Supervisor
+  // ingress session cookie / HA bearer token - e.g. HTTP Basic Auth for a
+  // standalone ESPHome dashboard reached directly instead of through Home
+  // Assistant Ingress, which understands neither of those.
+  constructor({ baseUrl, ingressSession = "", token = "", extraHeaders = {}, timeoutMs = 30000, WebSocketImpl = WebSocket }) {
     this.url = buildDeviceBuilderWebSocketUrl(baseUrl);
     this.ingressSession = ingressSession;
     this.token = token;
+    this.extraHeaders = extraHeaders;
     this.timeoutMs = timeoutMs;
     this.WebSocketImpl = WebSocketImpl;
     this.nextMessageId = 1;
@@ -51,6 +56,7 @@ export class ESPHomeDeviceBuilderClient {
     const headers = {};
     if (this.ingressSession) headers.Cookie = `ingress_session=${this.ingressSession}`;
     if (this.token) headers.Authorization = `Bearer ${this.token}`;
+    Object.assign(headers, this.extraHeaders);
 
     return new Promise((resolve, reject) => {
       const ws = new this.WebSocketImpl(this.url, { headers });
@@ -126,6 +132,7 @@ export class ESPHomeDeviceBuilderClient {
     const headers = {};
     if (this.ingressSession) headers.Cookie = `ingress_session=${this.ingressSession}`;
     if (this.token) headers.Authorization = `Bearer ${this.token}`;
+    Object.assign(headers, this.extraHeaders);
 
     return new Promise((resolve, reject) => {
       const ws = new this.WebSocketImpl(this.url, { headers });
