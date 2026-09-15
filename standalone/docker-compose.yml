@@ -6,9 +6,10 @@ services:
         # amd64 or aarch64 (matches `uname -m` aarch64, not arm64)
         BUILD_ARCH: ${BUILD_ARCH:-amd64}
         BUILD_VERSION: standalone-dev
-    # Uncomment to use a pre-built image instead of building locally, once
-    # you've pushed one somewhere (there is no published image yet):
-    # image: ghcr.io/<you>/ha-opencode-standalone:latest
+    # Uncomment to use the published image instead of building locally. CI
+    # publishes this automatically on every change to standalone/ that lands
+    # on main:
+    # image: ghcr.io/geekmystique/ha_opencode_standalone:latest
     container_name: opencode
     restart: unless-stopped
     env_file:
