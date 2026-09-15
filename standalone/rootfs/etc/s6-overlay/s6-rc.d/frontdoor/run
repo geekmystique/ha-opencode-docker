@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# OpenCode (standalone) - Front Door
+#
+# Home Assistant Ingress does not exist here, so there is no session cookie
+# validated upstream of this container. This single service is the entire
+# front door: it forwards to whichever UI backend is active (ttyd on 8100 for
+# terminal mode, OpenChamber on 3010 for openchamber mode) and, unlike the
+# HA-OS add-on's ingress/LAN split, is reachable from any remote address by
+# default. Set WEB_USERNAME + WEB_PASSWORD to require HTTP Basic Auth; leave
+# either unset only if this port never leaves a trusted network.
+# ==============================================================================
+
+if [ -f /data/.env_vars ]; then
+    # shellcheck disable=SC1091
+    source /data/.env_vars
+fi
+if [ -f /data/.env_vars_discovered ]; then
+    # shellcheck disable=SC1091
+    source /data/.env_vars_discovered
+fi
+
+export NODE_OPTIONS="--max-old-space-size=768"
+export PATH="/usr/local/bin:/usr/bin:/bin:${PATH}"
+
+INTERFACE_MODE="${INTERFACE_MODE:-terminal}"
+if [ "${INTERFACE_MODE}" = "openchamber" ]; then
+    HA_INGRESS_UI="openchamber"
+    UPSTREAM_PORT=3010
+else
+    HA_INGRESS_UI="terminal"
+    UPSTREAM_PORT=8100
+fi
+
+FRONTDOOR_PORT="${FRONTDOOR_PORT:-8099}"
+
+echo "=============================================="
+echo "  OpenCode front door (${HA_INGRESS_UI} mode)"
+echo "=============================================="
+echo "Listening on 0.0.0.0:${FRONTDOOR_PORT}"
+
+if [ -n "${WEB_USERNAME:-}" ] && [ -n "${WEB_PASSWORD:-}" ]; then
+    echo "HTTP Basic Auth is enabled (user: ${WEB_USERNAME})"
+else
+    echo "WARNING: WEB_USERNAME/WEB_PASSWORD are not both set - this port has NO authentication."
+    echo "WARNING: only publish it on a trusted network, or put a reverse proxy / VPN in front."
+fi
+
+# Deliberately does not inherit user runtime overrides or MCP secrets - this
+# process only relays HTTP/WebSocket bytes to the loopback UI backend.
+exec env -i PATH="/usr/local/bin:/usr/bin:/bin" NODE_OPTIONS="${NODE_OPTIONS}" \
+    HA_INGRESS_UI="${HA_INGRESS_UI}" \
+    OPENCHAMBER_ALLOW_ANY_REMOTE="true" \
+    OPENCHAMBER_INGRESS_HOST="0.0.0.0" \
+    OPENCHAMBER_INGRESS_PORT="${FRONTDOOR_PORT}" \
+    OPENCHAMBER_UPSTREAM_HOST="127.0.0.1" \
+    OPENCHAMBER_UPSTREAM_PORT="${UPSTREAM_PORT}" \
+    WEB_USERNAME="${WEB_USERNAME:-}" \
+    WEB_PASSWORD="${WEB_PASSWORD:-}" \
+    node /usr/local/bin/openchamber-ingress-proxy.js

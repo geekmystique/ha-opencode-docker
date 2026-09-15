@@ -1,0 +1,44 @@
+services:
+  opencode:
+    build:
+      context: .
+      args:
+        # amd64 or aarch64 (matches `uname -m` aarch64, not arm64)
+        BUILD_ARCH: ${BUILD_ARCH:-amd64}
+        BUILD_VERSION: standalone-dev
+    # Uncomment to use a pre-built image instead of building locally, once
+    # you've pushed one somewhere (there is no published image yet):
+    # image: ghcr.io/<you>/ha-opencode-standalone:latest
+    container_name: opencode
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      # Front door: terminal or OpenChamber, whichever INTERFACE_MODE picks.
+      # There is no Home Assistant Ingress here - see README.md for how to
+      # require a login (WEB_USERNAME/WEB_PASSWORD) before exposing this
+      # beyond localhost or a trusted LAN.
+      - "${FRONTDOOR_PORT:-8099}:${FRONTDOOR_PORT:-8099}"
+      # Optional: the `opencode attach` LAN server. Only listens when
+      # ENABLE_SERVER=true in .env; uncomment to publish it.
+      # - "4096:4096"
+    volumes:
+      # Point this at your real Home Assistant config directory (the folder
+      # with configuration.yaml in it).
+      - ${HA_CONFIG_DIR:-./ha-config}:/homeassistant
+      # OpenCode/opencode's own state (sessions, auth, npm-global, skills) -
+      # keep this a named volume or bind mount so it survives container
+      # recreation; do not point it at the HA config directory.
+      - opencode-data:/data
+      # Optional, only if you set ADDON_ACCESS_ENABLED=true and actually have
+      # these directories (they are an HA-OS/Supervisor concept - most
+      # standalone setups will not have them):
+      # - ./addons:/addons:ro
+      # - ./addon_configs:/addon_configs:ro
+    # Optional serial devices - list the same paths in SERIAL_DEVICES (colon
+    # separated) in .env so OpenCode knows about them too.
+    # devices:
+    #   - /dev/ttyUSB0:/dev/ttyUSB0
+
+volumes:
+  opencode-data:
