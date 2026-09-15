@@ -144,3 +144,22 @@ jobs:
               -type f \( -name '*.js' -o -name '*.mjs' \) \
               -not -path '*/node_modules/*' 2>/dev/null | sort -u)
           exit "${status}"
+
+  standalone-drift:
+    name: standalone/ drift check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Warn on ha_opencode/rootfs changes not ported to standalone/rootfs
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            BASE="${{ github.event.before }}"
+          else
+            BASE="origin/main"
+          fi
+          bash scripts/check-standalone-drift.sh "${BASE}" "${{ github.sha }}"
