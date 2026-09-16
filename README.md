@@ -4,6 +4,8 @@
 
 ### *AI-Powered Configuration Assistant for Home Assistant*
 
+*This is a personal fork of [magnusoverli/opencode](https://github.com/magnusoverli/opencode) — full credit to Magnus Overli for the original add-on.*
+
 [![Version][version-shield]][github]
 [![Project Stage][project-stage-shield]][github]
 [![License][license-shield]][license]
