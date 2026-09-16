@@ -171,6 +171,7 @@ const __dirname = dirname(__filename);
 
 const SUPERVISOR_API = process.env.HA_API_BASE_URL || "http://supervisor/core/api";
 const SUPERVISOR_BASE_URL = process.env.SUPERVISOR_BASE_URL || "http://supervisor";
+const SUPERVISOR_WS_URL = process.env.HA_WS_URL || "ws://supervisor/core/websocket";
 const HA_CONFIG_DIR = "/homeassistant";
 // Standalone (non-Supervisor) deployments never set SUPERVISOR_TOKEN, so this
 // is captured before the fallback below decides whether Supervisor-exclusive
@@ -1907,7 +1908,7 @@ async function fetchHARepairs() {
   dynamicCache.repairs.lastAttemptAt = now;
 
   return new Promise((resolve) => {
-    const wsUrl = "ws://supervisor/core/websocket";
+    const wsUrl = SUPERVISOR_WS_URL;
     let msgId = 1;
     const timeout = setTimeout(() => {
       try { ws.close(); } catch (_) {}
@@ -2011,7 +2012,7 @@ function callHAWebSocketCommand(commandType, timeoutMs = 5000) {
 
     let ws;
     try {
-      ws = new WebSocket("ws://supervisor/core/websocket");
+      ws = new WebSocket(SUPERVISOR_WS_URL);
     } catch (error) {
       clearTimeout(timeout);
       promiseReject(error);
