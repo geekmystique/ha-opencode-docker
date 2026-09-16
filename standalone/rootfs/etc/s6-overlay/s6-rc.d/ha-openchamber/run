@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# OpenCode (standalone) - OpenChamber Server Service
+# ==============================================================================
+
+export HOME="/data"
+export XDG_DATA_HOME="/data/.local/share"
+export XDG_CONFIG_HOME="/data/.config"
+export NPM_CONFIG_PREFIX="/data/.npm-global"
+export NODE_OPTIONS="--max-old-space-size=768"
+
+if [ -f /data/.env_vars ]; then
+    source /data/.env_vars
+fi
+
+if [ -n "${HA_ACCESS_TOKEN:-}" ]; then
+    export HA_TOKEN="${HA_ACCESS_TOKEN}"
+fi
+
+export PATH="/usr/local/bin:/usr/bin:/bin:${PATH}"
+export OPENCODE_DISABLE_AUTOUPDATE=true
+# OpenChamber otherwise performs a separate runtime update check and offers an
+# in-place upgrade. The image binary is a certified, immutable runtime.
+export OPENCHAMBER_BUNDLED_OPENCODE_CLI_DIR="/usr/local/bin"
+
+INTERFACE_MODE="${INTERFACE_MODE:-terminal}"
+if [ "${INTERFACE_MODE}" != "openchamber" ]; then
+    echo "Interface mode is '${INTERFACE_MODE}'; OpenChamber server is inactive."
+    exec sleep infinity
+fi
+
+OPENCHAMBER_INTERNAL_PORT=3010
+FRONTDOOR_PORT="${FRONTDOOR_PORT:-8099}"
+
+export OPENCHAMBER_DATA_DIR="/data/.config/openchamber"
+export OPENCHAMBER_HOST="127.0.0.1"
+export OPENCHAMBER_SKIP_API_COMPRESSION=true
+export OPENCHAMBER_COMPRESS_API=false
+export OPENCHAMBER_OPENCODE_HOSTNAME="127.0.0.1"
+# Neutralize OpenChamber's built-in self-update - see the equivalent comment
+# in the add-on version of this file. The canned "no update" endpoint below is
+# served by the front-door proxy (etc/s6-overlay/s6-rc.d/frontdoor).
+export OPENCHAMBER_UPDATE_API_URL="http://127.0.0.1:${FRONTDOOR_PORT}/__ha_openchamber_update_check"
+
+mkdir -p "${OPENCHAMBER_DATA_DIR}"
+
+echo "=============================================="
+echo "  OpenChamber server (standalone)"
+echo "=============================================="
+echo "Starting OpenChamber on 127.0.0.1:${OPENCHAMBER_INTERNAL_PORT}"
+
+OPENCHAMBER_BIN="/usr/local/bin/openchamber"
+
+cd /homeassistant
+
+exec "${OPENCHAMBER_BIN}" serve \
+    --foreground \
+    --port "${OPENCHAMBER_INTERNAL_PORT}" \
+    --host 127.0.0.1

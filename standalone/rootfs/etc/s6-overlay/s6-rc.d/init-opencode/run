@@ -1,0 +1,804 @@
+#!/command/with-contenv bash
+# ==============================================================================
+# OpenCode (standalone) - Initialization Service (oneshot)
+# Runs once at container startup to prepare the environment.
+#
+# This is the standalone-Docker sibling of the Home Assistant Supervisor
+# add-on's init-opencode. There is no Supervisor here, so every value that add-on
+# version read via `bashio::config` from Supervisor-injected /data/options.json
+# is read directly from the container environment instead (set in
+# docker-compose.yml / .env). The rest of the boot sequence - runtime
+# selection, opencode.json generation, AGENTS.md/skills deployment, home
+# context generation - is unchanged from the add-on.
+# ==============================================================================
+
+log_info()    { echo "[info] $*"; }
+log_notice()  { echo "[notice] $*"; }
+log_warning() { echo "[warning] $*" >&2; }
+log_error()   { echo "[error] $*" >&2; }
+
+# Which release channel this image is, and which paths in the shared
+# configuration directory belong to it. Standalone always resolves to the
+# "standalone" channel (see channel.sh) unless ADDON_CHANNEL is overridden.
+# shellcheck source=/usr/local/lib/opencode/channel.sh
+source /usr/local/lib/opencode/channel.sh
+
+log_info "Initializing ${ADDON_CHANNEL_LABEL} (${ADDON_CHANNEL} channel)..."
+
+# Baked into the image at build time (see Dockerfile) - there is no Supervisor
+# to ask for an add-on version.
+ADDON_VERSION=$(cat /usr/local/share/opencode-addon-version 2>/dev/null || echo "standalone")
+printf '%s\n' "${ADDON_VERSION}" > /data/.addon_version
+printf '%s\n' "${ADDON_CHANNEL}" > /data/.addon_channel
+
+# ==============================================================================
+# Read configuration options (from the container environment - see
+# standalone/.env.example for the full list and defaults)
+# ==============================================================================
+
+CPU_MODE_CONFIG="${CPU_MODE:-auto}"
+INTERFACE_MODE="${INTERFACE_MODE:-terminal}"
+MCP_ENABLED="${MCP_ENABLED:-true}"
+MCP_TOOL_PROFILE="${MCP_TOOL_PROFILE:-full}"
+NATIVE_HA_MCP_ENABLED="${NATIVE_HA_MCP_ENABLED:-false}"
+NATIVE_HA_MCP_API_ID="${NATIVE_HA_MCP_API_ID:-assist}"
+LSP_ENABLED="${LSP_ENABLED:-true}"
+SCREENSHOT_ENABLED="${SCREENSHOT_ENABLED:-false}"
+ADDON_ACCESS_ENABLED="${ADDON_ACCESS_ENABLED:-false}"
+PPQ_PRIVATE_ENABLED="${PPQ_PRIVATE_ENABLED:-false}"
+RESTRICT_SENSITIVE_FILES="${RESTRICT_SENSITIVE_FILES:-true}"
+FOCUS_MODE="${FOCUS_MODE:-false}"
+HOME_BRIEFING_ENABLED="${HOME_BRIEFING_ENABLED:-true}"
+DECISION_NOTES_ENABLED="${DECISION_NOTES_ENABLED:-true}"
+USER_HOOKS_ENABLED="${USER_HOOKS_ENABLED:-false}"
+
+TERMINAL_THEME="${TERMINAL_THEME:-breeze}"
+FONT_SIZE="${FONT_SIZE:-14}"
+CURSOR_STYLE="${CURSOR_STYLE:-block}"
+CURSOR_BLINK="${CURSOR_BLINK:-false}"
+
+ENABLE_SERVER="${ENABLE_SERVER:-false}"
+CORS_ORIGINS="${CORS_ORIGINS:-}"
+
+FRONTDOOR_PORT="${FRONTDOOR_PORT:-8099}"
+WEB_USERNAME="${WEB_USERNAME:-}"
+WEB_PASSWORD="${WEB_PASSWORD:-}"
+
+PPQ_API_KEY="${PPQ_API_KEY:-}"
+
+case "${MCP_TOOL_PROFILE}" in
+    compact|configuration|full)
+        ;;
+    *)
+        log_warning "Unknown MCP_TOOL_PROFILE '${MCP_TOOL_PROFILE}' - defaulting to full"
+        MCP_TOOL_PROFILE="full"
+        ;;
+esac
+
+log_info "Configuration: INTERFACE_MODE=${INTERFACE_MODE} MCP=${MCP_ENABLED} MCP_TOOL_PROFILE=${MCP_TOOL_PROFILE} NATIVE_HA_MCP=${NATIVE_HA_MCP_ENABLED} NATIVE_HA_MCP_API_ID=${NATIVE_HA_MCP_API_ID} LSP=${LSP_ENABLED} SCREENSHOT=${SCREENSHOT_ENABLED} PPQ_PRIVATE=${PPQ_PRIVATE_ENABLED} ADDON_ACCESS=${ADDON_ACCESS_ENABLED} CPU_MODE=${CPU_MODE_CONFIG} RESTRICT_SENSITIVE_FILES=${RESTRICT_SENSITIVE_FILES} FOCUS_MODE=${FOCUS_MODE} HOME_BRIEFING=${HOME_BRIEFING_ENABLED} DECISION_NOTES=${DECISION_NOTES_ENABLED} USER_HOOKS=${USER_HOOKS_ENABLED}"
+
+# ==============================================================================
+# Runtime paths
+# ==============================================================================
+
+export HOME="/data"
+export XDG_DATA_HOME="/data/.local/share"
+export XDG_CONFIG_HOME="/data/.config"
+export NPM_CONFIG_PREFIX="/data/.npm-global"
+OPENCODE_TMPDIR="/data/.cache/opencode-tmp"
+
+export PATH="/usr/local/bin:/usr/bin:/bin:${PATH}"
+export OPENCODE_DISABLE_AUTOUPDATE=true
+
+rm -rf "${OPENCODE_TMPDIR}"
+mkdir -p /data/.local/share/opencode /data/.config/opencode "${NPM_CONFIG_PREFIX}" "${OPENCODE_TMPDIR}"
+chmod 700 "${OPENCODE_TMPDIR}"
+printf '%s\n' "${INTERFACE_MODE}" > /data/.interface_mode
+
+# ==============================================================================
+# Home Assistant connection
+#
+# The Supervisor add-on gets SUPERVISOR_TOKEN auto-injected and talks to Core
+# through http://supervisor/core/api. There is no Supervisor here: the user
+# supplies a long-lived access token and Core's own URL directly, and every
+# server (MCP tool server, LSP, native MCP bridge, home-context generator)
+# already knows how to use HA_API_BASE_URL + HA_ACCESS_TOKEN in place of
+# SUPERVISOR_TOKEN + the Supervisor proxy - see standalone/README.md.
+# ==============================================================================
+
+ENV_VARS_FILE="/data/.env_vars"
+rm -f "${ENV_VARS_FILE}"
+
+if [ -z "${HA_URL:-}" ] || [ -z "${HA_ACCESS_TOKEN:-}" ]; then
+    log_warning "=============================================="
+    log_warning "  HA_URL and/or HA_ACCESS_TOKEN are not set"
+    log_warning "=============================================="
+    log_warning "Home Assistant tools (config validation against Core, entity/service"
+    log_warning "data, screenshots, LSP entity completion, home context) will not work"
+    log_warning "until both are set. Direct file editing under /homeassistant still works."
+    log_warning "Set them in docker-compose.yml / .env - see standalone/README.md."
+fi
+
+HA_URL="${HA_URL:-http://homeassistant:8123}"
+HA_URL="${HA_URL%/}"
+case "${HA_URL}" in
+    http://*|https://*) ;;
+    *) HA_URL="http://${HA_URL}" ;;
+esac
+case "${HA_URL}" in
+    https://*) HA_WS_SCHEME="wss" ;;
+    *) HA_WS_SCHEME="ws" ;;
+esac
+HA_WS_URL="${HA_WS_SCHEME}://${HA_URL#*://}/api/websocket"
+
+printf 'export HA_URL=%q\n' "${HA_URL}" >> "${ENV_VARS_FILE}"
+printf 'export HA_API_BASE_URL=%q\n' "${HA_URL}/api" >> "${ENV_VARS_FILE}"
+printf 'export HA_WS_URL=%q\n' "${HA_WS_URL}" >> "${ENV_VARS_FILE}"
+printf 'export HA_VERIFY_SSL=%q\n' "${HA_VERIFY_SSL:-true}" >> "${ENV_VARS_FILE}"
+if [ -n "${HA_ACCESS_TOKEN:-}" ]; then
+    printf 'export HA_ACCESS_TOKEN=%q\n' "${HA_ACCESS_TOKEN}" >> "${ENV_VARS_FILE}"
+    log_info "Home Assistant access token configured (${HA_URL})"
+else
+    log_info "No Home Assistant access token configured"
+fi
+chmod 600 "${ENV_VARS_FILE}"
+
+# ==============================================================================
+# Export system-managed runtime paths for all services and shell sessions
+# ==============================================================================
+
+printf 'export NPM_CONFIG_PREFIX=%q\n' "${NPM_CONFIG_PREFIX}" >> "${ENV_VARS_FILE}"
+printf 'export TMPDIR=%q\n' "${OPENCODE_TMPDIR}" >> "${ENV_VARS_FILE}"
+printf 'export PATH="/usr/local/bin:/usr/bin:/bin:${PATH}"\n' >> "${ENV_VARS_FILE}"
+printf 'export OPENCODE_DISABLE_AUTOUPDATE=true\n' >> "${ENV_VARS_FILE}"
+
+# Resolved values every other service would otherwise have to re-derive
+# themselves (the add-on version re-queried bashio::config per-service; here
+# everything is centralized since there is no per-process config source).
+printf 'export INTERFACE_MODE=%q\n' "${INTERFACE_MODE}" >> "${ENV_VARS_FILE}"
+printf 'export TERMINAL_THEME=%q\n' "${TERMINAL_THEME}" >> "${ENV_VARS_FILE}"
+printf 'export FONT_SIZE=%q\n' "${FONT_SIZE}" >> "${ENV_VARS_FILE}"
+printf 'export CURSOR_STYLE=%q\n' "${CURSOR_STYLE}" >> "${ENV_VARS_FILE}"
+printf 'export CURSOR_BLINK=%q\n' "${CURSOR_BLINK}" >> "${ENV_VARS_FILE}"
+printf 'export ENABLE_SERVER=%q\n' "${ENABLE_SERVER}" >> "${ENV_VARS_FILE}"
+printf 'export CORS_ORIGINS=%q\n' "${CORS_ORIGINS}" >> "${ENV_VARS_FILE}"
+printf 'export FRONTDOOR_PORT=%q\n' "${FRONTDOOR_PORT}" >> "${ENV_VARS_FILE}"
+printf 'export WEB_USERNAME=%q\n' "${WEB_USERNAME}" >> "${ENV_VARS_FILE}"
+printf 'export WEB_PASSWORD=%q\n' "${WEB_PASSWORD}" >> "${ENV_VARS_FILE}"
+chmod 600 "${ENV_VARS_FILE}"
+
+# ==============================================================================
+# Expose configured serial devices to OpenCode and shell sessions
+# Standalone: colon-separated device paths, mapped into the container via
+# docker-compose `devices:` - see standalone/README.md.
+# ==============================================================================
+
+if [ -n "${SERIAL_DEVICES:-}" ]; then
+    printf 'export OPENCODE_SERIAL_DEVICES=%q\n' "${SERIAL_DEVICES}" >> "${ENV_VARS_FILE}"
+    chmod 600 "${ENV_VARS_FILE}"
+    log_info "Serial devices configured: ${SERIAL_DEVICES}"
+else
+    log_info "No serial devices configured"
+fi
+
+# ==============================================================================
+# Export PPQ API key for the internal private-mode proxy
+# ==============================================================================
+
+PPQ_API_KEY_CONFIGURED=false
+
+if [ "${PPQ_PRIVATE_ENABLED}" = "true" ]; then
+    if [ -n "${PPQ_API_KEY}" ]; then
+        printf 'export PPQ_API_KEY=%q\n' "${PPQ_API_KEY}" >> "${ENV_VARS_FILE}"
+        chmod 600 "${ENV_VARS_FILE}"
+        log_info "PPQ private mode enabled; API key configured"
+        PPQ_API_KEY_CONFIGURED=true
+    else
+        log_warning "PPQ private mode is enabled, but no PPQ_API_KEY is configured"
+        log_warning "The PPQ proxy and OpenCode provider will stay inactive until a key is added"
+    fi
+else
+    log_info "PPQ private mode disabled"
+fi
+
+# ==============================================================================
+# Extra mounted folders (optional; e.g. if you bind-mount other apps'
+# directories alongside the Home Assistant config directory)
+# ==============================================================================
+
+printf '%s\n' "${ADDON_ACCESS_ENABLED}" > /data/.addon_access_enabled
+printf '%s\n' "${USER_HOOKS_ENABLED}" > /data/.user_hooks_enabled
+
+if [ "${ADDON_ACCESS_ENABLED}" = "true" ]; then
+    printf 'export OPENCODE_ADDON_ACCESS_ENABLED=true\n' >> "${ENV_VARS_FILE}"
+    chmod 600 "${ENV_VARS_FILE}"
+    log_warning "Extra folder access is enabled. If you have bind-mounted /addons or /addon_configs,"
+    log_warning "OpenCode will be told about them; edit anything mounted there carefully."
+else
+    printf 'export OPENCODE_ADDON_ACCESS_ENABLED=false\n' >> "${ENV_VARS_FILE}"
+    chmod 600 "${ENV_VARS_FILE}"
+fi
+
+# ==============================================================================
+# Zigbee2MQTT (manual only - there is no Supervisor to auto-discover it from)
+# ==============================================================================
+
+if [ -n "${Z2M_URL:-}" ]; then
+    case "${Z2M_URL}" in
+        http://*|https://*) ;;
+        *)
+            Z2M_URL="http://${Z2M_URL}"
+            log_info "Z2M_URL missing scheme; defaulting to ${Z2M_URL}"
+            ;;
+    esac
+    printf 'export Z2M_URL=%q\n' "${Z2M_URL}" >> "${ENV_VARS_FILE}"
+    log_info "Zigbee2MQTT URL configured: ${Z2M_URL}"
+    if [ -n "${Z2M_MQTT_TOPIC:-}" ]; then
+        printf 'export Z2M_MQTT_TOPIC=%q\n' "${Z2M_MQTT_TOPIC}" >> "${ENV_VARS_FILE}"
+    fi
+    chmod 600 "${ENV_VARS_FILE}"
+fi
+
+# ==============================================================================
+# ESPHome (manual only - there is no Supervisor to discover the ESPHome
+# add-on and mint it a Home Assistant Ingress session from). Point this at
+# your own ESPHome dashboard directly, e.g. the official esphome/esphome
+# Docker image's dashboard - it is reached with no Ingress in front of it at
+# all, so all 21 esphome_* MCP tools talk to it straight over its own
+# WebSocket API. ESPHOME_USERNAME/PASSWORD are only needed if that dashboard
+# was started with --username/--password; they carry HTTP Basic Auth, since
+# a plain ESPHome dashboard has no idea what a Home Assistant token is.
+# ==============================================================================
+
+if [ -n "${ESPHOME_URL:-}" ]; then
+    case "${ESPHOME_URL}" in
+        http://*|https://*) ;;
+        *)
+            ESPHOME_URL="http://${ESPHOME_URL}"
+            log_info "ESPHOME_URL missing scheme; defaulting to ${ESPHOME_URL}"
+            ;;
+    esac
+    printf 'export ESPHOME_URL=%q\n' "${ESPHOME_URL}" >> "${ENV_VARS_FILE}"
+    log_info "ESPHome dashboard URL configured: ${ESPHOME_URL}"
+    if [ -n "${ESPHOME_USERNAME:-}" ]; then
+        printf 'export ESPHOME_USERNAME=%q\n' "${ESPHOME_USERNAME}" >> "${ENV_VARS_FILE}"
+        printf 'export ESPHOME_PASSWORD=%q\n' "${ESPHOME_PASSWORD:-}" >> "${ENV_VARS_FILE}"
+    fi
+    chmod 600 "${ENV_VARS_FILE}"
+fi
+
+# ==============================================================================
+# Export screenshot_enabled flag for the MCP server
+# ==============================================================================
+
+if [ "${SCREENSHOT_ENABLED}" = "true" ]; then
+    printf 'export SCREENSHOT_ENABLED=true\n' >> "${ENV_VARS_FILE}"
+    chmod 600 "${ENV_VARS_FILE}"
+    log_info "Screenshot tool enabled (Chromium headless for visual verification)"
+else
+    log_info "Screenshot tool disabled"
+fi
+
+# ==============================================================================
+# Export home context flags
+# ==============================================================================
+
+printf 'export OPENCODE_HOME_BRIEFING=%s\n' "${HOME_BRIEFING_ENABLED}" >> "${ENV_VARS_FILE}"
+printf 'export OPENCODE_DECISION_NOTES=%s\n' "${DECISION_NOTES_ENABLED}" >> "${ENV_VARS_FILE}"
+printf 'export OPENCODE_MCP_ENABLED=%s\n' "${MCP_ENABLED}" >> "${ENV_VARS_FILE}"
+printf 'export OPENCODE_MCP_TOOL_PROFILE=%q\n' "${MCP_TOOL_PROFILE}" >> "${ENV_VARS_FILE}"
+printf 'export OPENCODE_NATIVE_HA_MCP_ENABLED=%s\n' "${NATIVE_HA_MCP_ENABLED}" >> "${ENV_VARS_FILE}"
+printf 'export OPENCODE_LSP_ENABLED=%s\n' "${LSP_ENABLED}" >> "${ENV_VARS_FILE}"
+printf 'export OPENCODE_RESTRICT_SENSITIVE_FILES=%s\n' "${RESTRICT_SENSITIVE_FILES}" >> "${ENV_VARS_FILE}"
+chmod 600 "${ENV_VARS_FILE}"
+
+# ==============================================================================
+# CPU Capability Detection - record diagnostics for OpenCode's runtime selector
+#
+# OpenCode ships Bun-compiled binaries, so Bun's CPU floor is OpenCode's. The
+# regular x64 build targets Haswell (AVX2); the x64 "baseline" build targets
+# Nehalem, which still requires SSE4.2 (the x86-64-v2 level). Below SSE4.2 no
+# published build starts at all, and the only useful thing this can do is name
+# the cause instead of leaving the user with a bare "Illegal instruction
+# (core dumped)".
+# ==============================================================================
+
+CPU_UNSUPPORTED_MARKER=/data/.cpu_unsupported
+
+warn_baseline_mode() {
+    log_warning "OpenCode x64 baseline mode may be used because AVX2 is not visible to the container."
+    log_warning "If this runs in a VM on an AVX2-capable host, enable host CPU passthrough; generic QEMU/KVM CPU models can hide AVX2."
+    log_warning "Upstream currently publishes the regular AVX2 binary inside the x64 baseline package, so baseline mode may still fail with an illegal instruction: https://github.com/anomalyco/opencode/issues/33595"
+    log_warning "Known upstream baseline OOM issue: https://github.com/anomalyco/opencode/issues/20988"
+}
+
+report_unsupported_cpu() {
+    local model_name
+    model_name=$(awk -F': ' '/^model name/ {print $2; exit}' /proc/cpuinfo 2>/dev/null)
+    log_error "This CPU cannot run OpenCode: ${model_name:-unknown CPU} does not support SSE4.2."
+    log_error "OpenCode is built with Bun, whose oldest supported target (the x64 'baseline' build) requires SSE4.2 - the x86-64-v2 level, meaning Intel Nehalem (2008) or newer, or AMD Bulldozer (2011) / Jaguar (2013) or newer."
+    log_error "No published OpenCode binary, regular or baseline, will start on this hardware; it exits immediately with 'Illegal instruction (core dumped)'."
+    log_error "The rest of the container still works, but OpenCode itself cannot run on this machine. Setting CPU_MODE to 'baseline' does not change this."
+}
+
+detect_cpu_capabilities() {
+    local cpu_mode_config="${CPU_MODE_CONFIG:-auto}"
+    local machine
+    local cpu_flags=""
+    local has_avx2=false
+    local has_avx=false
+    local has_sse42=false
+
+    machine=$(uname -m)
+
+    rm -f "${CPU_UNSUPPORTED_MARKER}"
+
+    if [ -f /proc/cpuinfo ]; then
+        cpu_flags=$(awk -F': ' '/^flags/ {print $2; exit}' /proc/cpuinfo)
+    fi
+
+    if echo "${cpu_flags}" | grep -q '\bavx2\b'; then
+        has_avx2=true
+    fi
+
+    if echo "${cpu_flags}" | grep -q '\bavx\b'; then
+        has_avx=true
+    fi
+
+    if echo "${cpu_flags}" | grep -q '\bsse4_2\b'; then
+        has_sse42=true
+    fi
+
+    if [ "${machine}" = "aarch64" ] || [ "${machine}" = "arm64" ]; then
+        echo "regular" > /data/.cpu_mode
+        if [ "${cpu_mode_config}" = "baseline" ]; then
+            log_warning "CPU mode baseline was requested, but ARM64 has no OpenCode baseline package; using regular binary"
+        else
+            log_info "ARM64 architecture detected - using regular OpenCode binary"
+        fi
+        return
+    fi
+
+    if [ "${has_sse42}" != "true" ]; then
+        printf '1\n' > "${CPU_UNSUPPORTED_MARKER}"
+        report_unsupported_cpu
+        echo "baseline" > /data/.cpu_mode
+        return
+    fi
+
+    if [ "${cpu_mode_config}" = "baseline" ]; then
+        echo "baseline" > /data/.cpu_mode
+        log_warning "CPU mode forced to baseline by configuration"
+        warn_baseline_mode
+        return
+    elif [ "${cpu_mode_config}" = "regular" ]; then
+        echo "regular" > /data/.cpu_mode
+        if [ "${machine}" = "x86_64" ] && [ "${has_avx2}" != "true" ]; then
+            log_warning "CPU mode forced to regular, but AVX2 is not visible; OpenCode may fail with an illegal instruction"
+        else
+            log_info "CPU mode forced to regular by configuration"
+        fi
+        return
+    fi
+
+    if [ "${has_avx2}" = "true" ]; then
+        echo "regular" > /data/.cpu_mode
+        log_info "CPU supports AVX2 - OpenCode regular binary will be selected"
+    elif [ "${has_avx}" = "true" ]; then
+        echo "baseline" > /data/.cpu_mode
+        log_warning "CPU has AVX but not AVX2 - OpenCode baseline binary will be selected"
+        warn_baseline_mode
+    else
+        echo "baseline" > /data/.cpu_mode
+        log_warning "CPU lacks AVX support - OpenCode baseline binary will be selected"
+        warn_baseline_mode
+    fi
+}
+
+detect_cpu_capabilities
+
+# ==============================================================================
+# Select and verify the certified OpenCode runtime
+# ==============================================================================
+
+opencode_log() { log_info "$*"; }
+# shellcheck source=/usr/local/lib/opencode/runtime.sh
+source /usr/local/lib/opencode/runtime.sh
+
+setup_opencode_runtime() {
+    local cpu_mode bundled_package bundled_bin
+    local certified_version effective_bin effective_version
+
+    bundled_package="/usr/local/lib/node_modules/opencode-ai"
+    bundled_bin="/usr/local/bin/opencode"
+
+    cpu_mode=$(cat /data/.cpu_mode 2>/dev/null || echo "regular")
+    certified_version=$(opencode_certified_version)
+    log_info "Certified OpenCode version: ${certified_version}"
+
+    opencode_select_package_binary "${bundled_package}" "${cpu_mode}" || true
+    if ! opencode_bin_runs "${bundled_bin}"; then
+        if [ -f "${CPU_UNSUPPORTED_MARKER}" ]; then
+            log_error "The certified OpenCode binary failed to execute because this CPU lacks SSE4.2 (see the CPU message above); the terminal will start but OpenCode will not run"
+        else
+            log_error "The certified OpenCode binary failed to execute; the terminal may not start correctly"
+        fi
+    fi
+
+    effective_bin=$(command -v opencode 2>/dev/null || echo "not-found")
+    effective_version=$(opencode --version 2>/dev/null || echo "unknown")
+    printf '%s\n' "${effective_bin}" > /data/.opencode_bin
+    printf '%s\n' "${effective_version}" > /data/.opencode_version
+    log_info "Effective OpenCode binary: ${effective_bin}"
+    log_info "Effective OpenCode version: ${effective_version}"
+
+    case "${effective_bin}" in
+        /usr/local/bin/opencode|not-found) ;;
+        *)
+            log_warning "OpenCode resolved to ${effective_bin}, not the certified runtime in this image"
+            ;;
+    esac
+    if [ "${effective_version}" != "unknown" ] && [ "${effective_version}" != "${certified_version}" ]; then
+        log_warning "Running OpenCode ${effective_version} but this image certified ${certified_version}"
+    fi
+}
+
+setup_opencode_runtime
+
+# ==============================================================================
+# Verify hab and zigporter CLIs are available
+# ==============================================================================
+
+HELP_STAMP_FILE="/data/.help_stamp"
+STAMP_ADDON=""
+STAMP_HAB=""
+STAMP_ZIGPORTER=""
+if [ -f "${HELP_STAMP_FILE}" ]; then
+    IFS=':' read -r STAMP_ADDON STAMP_HAB STAMP_ZIGPORTER < "${HELP_STAMP_FILE}" || true
+fi
+HELP_STAMP_FRESH=false
+if [ "${STAMP_ADDON}" = "${ADDON_VERSION}" ] && [ -n "${STAMP_HAB}" ]; then
+    HELP_STAMP_FRESH=true
+fi
+
+if command -v hab &>/dev/null; then
+    if [ "${HELP_STAMP_FRESH}" = "true" ]; then
+        HAB_VERSION="${STAMP_HAB}"
+    else
+        HAB_VERSION=$(hab version 2>/dev/null | grep -oP '[\d.]+' | head -1 || echo "unknown")
+    fi
+    log_info "hab CLI available (v${HAB_VERSION}) - uses HA_URL/HA_ACCESS_TOKEN directly"
+else
+    log_warning "hab CLI not found - some admin features will be unavailable"
+fi
+
+if command -v zigporter &>/dev/null; then
+    if [ "${HELP_STAMP_FRESH}" = "true" ]; then
+        ZIGPORTER_VERSION="${STAMP_ZIGPORTER}"
+    else
+        ZIGPORTER_VERSION=$(zigporter --version 2>/dev/null | grep -oP '[\d.]+' | head -1 || echo "unknown")
+    fi
+    log_info "zigporter CLI available (v${ZIGPORTER_VERSION}) - Zigbee rename, inspect, mesh tools"
+else
+    log_warning "zigporter CLI not found - Zigbee management features will be unavailable"
+fi
+
+# ==============================================================================
+# Deploy AGENTS.md
+# On first install: copy the full file. On update: refresh only when the
+# deployed copy is byte-for-byte what this image last wrote, so user edits are
+# never overwritten.
+# ==============================================================================
+
+AGENTS_TARGET="${ADDON_AGENTS_FILE}"
+AGENTS_HASH_FILE="${ADDON_AGENTS_MARKER}"
+AGENTS_REFRESHED=false
+
+agents_md_hash() {
+    sha256sum "$1" 2>/dev/null | cut -d' ' -f1
+}
+
+mkdir -p "$(dirname "${AGENTS_TARGET}")"
+
+if [ ! -f "${AGENTS_TARGET}" ]; then
+    cp /opt/ha-mcp-server/AGENTS.md "${AGENTS_TARGET}"
+    AGENTS_REFRESHED=true
+    log_info "Deployed default AGENTS.md to ${AGENTS_TARGET}"
+    log_info "Add your own instructions in /homeassistant/AGENTS.local.md - it is loaded too and never overwritten"
+elif [ "${HELP_STAMP_FRESH}" = "true" ]; then
+    log_info "AGENTS.md is current (image version unchanged) - skipping refresh"
+elif [ ! -f "${AGENTS_HASH_FILE}" ]; then
+    AGENTS_BACKUP="${AGENTS_TARGET}.bak"
+    if [ -f "${AGENTS_BACKUP}" ]; then
+        AGENTS_BACKUP="${AGENTS_TARGET}.$(date +%Y%m%d%H%M%S).bak"
+    fi
+    cp "${AGENTS_TARGET}" "${AGENTS_BACKUP}"
+    cp /opt/ha-mcp-server/AGENTS.md "${AGENTS_TARGET}"
+    AGENTS_REFRESHED=true
+    log_info "Updated AGENTS.md with latest AI instructions"
+    log_info "Your previous AGENTS.md was saved to ${AGENTS_BACKUP}"
+    log_info "Move any customizations into /homeassistant/AGENTS.local.md - future updates never touch that file"
+else
+    AGENTS_CURRENT_HASH=$(agents_md_hash "${AGENTS_TARGET}")
+    AGENTS_EXPECTED_HASH=$(cat "${AGENTS_HASH_FILE}" 2>/dev/null || echo "")
+    if [ -n "${AGENTS_CURRENT_HASH}" ] && [ "${AGENTS_CURRENT_HASH}" = "${AGENTS_EXPECTED_HASH}" ]; then
+        cp /opt/ha-mcp-server/AGENTS.md "${AGENTS_TARGET}"
+        AGENTS_REFRESHED=true
+        log_info "Updated AGENTS.md with latest AI instructions"
+    else
+        log_info "AGENTS.md has your own edits - keeping it and skipping the update"
+        log_info "Instructions in /homeassistant/AGENTS.local.md are loaded as well and are never overwritten"
+    fi
+fi
+
+if [ "${AGENTS_REFRESHED}" = "true" ] && command -v hab &>/dev/null && [ -f "${AGENTS_TARGET}" ]; then
+    if grep -q "<!-- HAB_LIVE_HELP_START -->" "${AGENTS_TARGET}" 2>/dev/null; then
+        HAB_HELP_OUTPUT=$(hab --help 2>/dev/null || echo "")
+        if [ -n "${HAB_HELP_OUTPUT}" ]; then
+            printf '%s\n' "${HAB_HELP_OUTPUT}" > /tmp/hab_help.txt
+            awk '
+                /<!-- HAB_LIVE_HELP_START -->/ {
+                    print
+                    print "```"
+                    while ((getline line < "/tmp/hab_help.txt") > 0) print line
+                    print "```"
+                    skip=1
+                    next
+                }
+                /<!-- HAB_LIVE_HELP_END -->/ {
+                    skip=0
+                    print
+                    next
+                }
+                !skip { print }
+            ' "${AGENTS_TARGET}" > /tmp/agents_tmp \
+                && mv /tmp/agents_tmp "${AGENTS_TARGET}"
+            rm -f /tmp/hab_help.txt
+            log_info "Injected live hab help (v${HAB_VERSION}) into AGENTS.md"
+        fi
+    fi
+fi
+
+if [ "${AGENTS_REFRESHED}" = "true" ] && command -v zigporter &>/dev/null && [ -f "${AGENTS_TARGET}" ]; then
+    if grep -q "<!-- ZIGPORTER_LIVE_HELP_START -->" "${AGENTS_TARGET}" 2>/dev/null; then
+        ZIGPORTER_HELP_OUTPUT=$(zigporter --help 2>/dev/null || echo "")
+        if [ -n "${ZIGPORTER_HELP_OUTPUT}" ]; then
+            printf '%s\n' "${ZIGPORTER_HELP_OUTPUT}" > /tmp/zigporter_help.txt
+            awk '
+                /<!-- ZIGPORTER_LIVE_HELP_START -->/ {
+                    print
+                    print "```"
+                    while ((getline line < "/tmp/zigporter_help.txt") > 0) print line
+                    print "```"
+                    skip=1
+                    next
+                }
+                /<!-- ZIGPORTER_LIVE_HELP_END -->/ {
+                    skip=0
+                    print
+                    next
+                }
+                !skip { print }
+            ' "${AGENTS_TARGET}" > /tmp/agents_tmp \
+                && mv /tmp/agents_tmp "${AGENTS_TARGET}"
+            rm -f /tmp/zigporter_help.txt
+            log_info "Injected live zigporter help (v${ZIGPORTER_VERSION}) into AGENTS.md"
+        fi
+    fi
+fi
+
+if [ "${AGENTS_REFRESHED}" = "true" ] && [ -f "${AGENTS_TARGET}" ]; then
+    agents_md_hash "${AGENTS_TARGET}" > "${AGENTS_HASH_FILE}"
+fi
+
+if [ "${HELP_STAMP_FRESH}" != "true" ]; then
+    printf '%s:%s:%s\n' "${ADDON_VERSION}" "${HAB_VERSION:-unknown}" "${ZIGPORTER_VERSION:-unknown}" > "${HELP_STAMP_FILE}"
+fi
+
+# ==============================================================================
+# Deploy the AGENTS.local.md example (first install only)
+# ==============================================================================
+
+if [ ! -f "/homeassistant/AGENTS.local.md" ] && [ ! -f "/homeassistant/AGENTS.local.md.example" ]; then
+    cp /opt/ha-mcp-server/AGENTS.local.md.example /homeassistant/AGENTS.local.md.example
+    log_info "Deployed AGENTS.local.md.example - rename it to AGENTS.local.md to add your own instructions"
+fi
+
+# ==============================================================================
+# Deploy Prettier config for HA YAML formatting (first install only)
+# ==============================================================================
+
+if [ ! -f "/homeassistant/.prettierrc.yaml" ]; then
+    cp /opt/ha-mcp-server/.prettierrc.yaml /homeassistant/.prettierrc.yaml
+    log_info "Deployed default .prettierrc.yaml for HA YAML formatting"
+fi
+
+# ==============================================================================
+# Deploy the image's skills and agents
+# ==============================================================================
+
+node /usr/local/bin/deploy-opencode-assets.mjs 2>&1 | while IFS= read -r line; do
+    case "${line}" in
+        "") ;;
+        "[warning] "*) log_warning "${line#\[warning\] }" ;;
+        *) log_info "${line}" ;;
+    esac
+done || true
+
+# ==============================================================================
+# Generate OpenCode configuration file
+# ==============================================================================
+
+MCP_BOOL=$([ "${MCP_ENABLED}" = "true" ] && echo "true" || echo "false")
+NATIVE_HA_MCP_BOOL=$([ "${NATIVE_HA_MCP_ENABLED}" = "true" ] && echo "true" || echo "false")
+LSP_DISABLED=$([ "${LSP_ENABLED}" = "true" ] && echo "false" || echo "true")
+PPQ_PROVIDER_ENABLED=$([ "${PPQ_PRIVATE_ENABLED}" = "true" ] && [ "${PPQ_API_KEY_CONFIGURED}" = "true" ] && echo "true" || echo "false")
+RESTRICT_BOOL=$([ "${RESTRICT_SENSITIVE_FILES}" = "true" ] && echo "true" || echo "false")
+FOCUS_BOOL=$([ "${FOCUS_MODE}" = "true" ] && echo "true" || echo "false")
+BRIEFING_BOOL=$([ "${HOME_BRIEFING_ENABLED}" = "true" ] && echo "true" || echo "false")
+NOTES_BOOL=$([ "${DECISION_NOTES_ENABLED}" = "true" ] && echo "true" || echo "false")
+HOOKS_BOOL=$([ "${USER_HOOKS_ENABLED}" = "true" ] && echo "true" || echo "false")
+
+CHANNEL_AGENTS_INSTRUCTION=""
+if [ "${ADDON_AGENTS_IN_CONFIG_DIR}" != "true" ]; then
+    CHANNEL_AGENTS_INSTRUCTION="${ADDON_AGENTS_FILE}"
+fi
+
+jq --arg native_ha_mcp_api_id "${NATIVE_HA_MCP_API_ID}" --arg mcp_tool_profile "${MCP_TOOL_PROFILE}" --arg profile_instruction "/opt/ha-mcp-server/MCP_PROFILE_$(echo "${MCP_TOOL_PROFILE}" | tr "[:lower:]" "[:upper:]").md" --arg channel_agents "${CHANNEL_AGENTS_INSTRUCTION}" --argjson mcp "${MCP_BOOL}" --argjson native_ha_mcp "${NATIVE_HA_MCP_BOOL}" --argjson lsp_disabled "${LSP_DISABLED}" --argjson ppq "${PPQ_PROVIDER_ENABLED}" --argjson restrict "${RESTRICT_BOOL}" --argjson focus "${FOCUS_BOOL}" --argjson briefing "${BRIEFING_BOOL}" --argjson notes "${NOTES_BOOL}" --argjson hooks "${HOOKS_BOOL}" '
+    .mcp.homeassistant.enabled = $mcp |
+    .mcp.homeassistant.environment.HA_NATIVE_MCP_API_ID = $native_ha_mcp_api_id |
+    .mcp.homeassistant.environment.OPENCODE_MCP_TOOL_PROFILE = $mcp_tool_profile |
+    .mcp.homeassistant.environment.OPENCODE_NATIVE_HA_MCP_ENABLED = ($native_ha_mcp | tostring) |
+    .mcp.homeassistant_native.enabled = ($mcp and $native_ha_mcp) |
+    .mcp.homeassistant_native.command = ["node", "/opt/ha-mcp-server/ha-native-mcp-proxy.js", $native_ha_mcp_api_id] |
+    .mcp.homeassistant_native.environment.HA_NATIVE_MCP_API_ID = $native_ha_mcp_api_id |
+    if $lsp_disabled then .lsp["ha-yaml"].disabled = true else del(.lsp["ha-yaml"].disabled) end |
+    if $restrict then
+        .permission.read = {
+            "*": "allow",
+            "*secrets.yaml": "deny",
+            "*.storage/*": "deny",
+            "*.cloud/*": "deny",
+            "*ssl/*": "deny",
+            "*.key": "deny",
+            "*.pem": "deny"
+        }
+    else del(.permission.read) end |
+    if $focus then
+        .instructions = ((.instructions // []) + ["/opt/ha-mcp-server/FOCUS_MODE.md"])
+    else . end |
+    if $mcp then .instructions = ((.instructions // []) + [$profile_instruction]) else . end |
+    if $briefing then
+        .instructions = ((.instructions // []) + ["/data/context/home-briefing.md"])
+    else . end |
+    if $notes then
+        .instructions = ((.instructions // []) + ["/data/context/decision-notes.md"])
+    else . end |
+    if $hooks then
+        .instructions = ((.instructions // []) + ["/opt/ha-mcp-server/USER_HOOKS.md"])
+    else . end |
+    if ($channel_agents | length) > 0 then
+        .instructions = ((.instructions // []) + [$channel_agents])
+    else . end |
+    .instructions = ((.instructions // []) + ["/homeassistant/AGENTS.local.md"]) |
+    if $ppq then
+        .provider = (.provider // {}) |
+        .provider["ppq-private"] = {
+            "npm": "@ai-sdk/openai-compatible",
+            "name": "PPQ Private (TEE)",
+            "options": {
+                "apiKey": "unused",
+                "baseURL": "http://127.0.0.1:8787/v1",
+                "timeout": 600000,
+                "chunkTimeout": 60000
+            },
+            "models": {
+                "private/kimi-k2-5": {
+                    "id": "private/kimi-k2-5",
+                    "name": "Kimi K2.5 (Private)",
+                    "modalities": { "input": ["text"], "output": ["text"] },
+                    "limit": { "context": 262144, "output": 8192 }
+                },
+                "private/deepseek-r1-0528": {
+                    "id": "private/deepseek-r1-0528",
+                    "name": "DeepSeek R1 (Private)",
+                    "reasoning": true,
+                    "modalities": { "input": ["text"], "output": ["text"] },
+                    "limit": { "context": 131072, "output": 8192 }
+                },
+                "private/gpt-oss-120b": {
+                    "id": "private/gpt-oss-120b",
+                    "name": "GPT-OSS 120B (Private)",
+                    "modalities": { "input": ["text"], "output": ["text"] },
+                    "limit": { "context": 131072, "output": 8192 }
+                },
+                "private/llama3-3-70b": {
+                    "id": "private/llama3-3-70b",
+                    "name": "Llama 3.3 70B (Private)",
+                    "modalities": { "input": ["text"], "output": ["text"] },
+                    "limit": { "context": 131072, "output": 8192 }
+                },
+                "private/qwen3-vl-30b": {
+                    "id": "private/qwen3-vl-30b",
+                    "name": "Qwen3-VL 30B (Private)",
+                    "attachment": true,
+                    "modalities": { "input": ["text", "image"], "output": ["text"] },
+                    "limit": { "context": 262144, "output": 8192 }
+                }
+            }
+        }
+    else . end
+' /opt/ha-mcp-server/opencode-ha.json > /data/.config/opencode/opencode.json
+
+log_info "OpenCode configuration generated successfully"
+
+# ==============================================================================
+# Generate the home context files
+# ==============================================================================
+
+mkdir -p /data/context
+
+if [ "${HOME_BRIEFING_ENABLED}" = "true" ] || [ "${DECISION_NOTES_ENABLED}" = "true" ]; then
+    log_info "Generating home context in the background (briefing=${HOME_BRIEFING_ENABLED} decision notes=${DECISION_NOTES_ENABLED})..."
+    OPENCODE_HOME_BRIEFING="${HOME_BRIEFING_ENABLED}" \
+    OPENCODE_DECISION_NOTES="${DECISION_NOTES_ENABLED}" \
+    OPENCODE_MCP_ENABLED="${MCP_ENABLED}" \
+    OPENCODE_MCP_TOOL_PROFILE="${MCP_TOOL_PROFILE}" \
+    OPENCODE_LSP_ENABLED="${LSP_ENABLED}" \
+    OPENCODE_RESTRICT_SENSITIVE_FILES="${RESTRICT_SENSITIVE_FILES}" \
+    OPENCODE_ADDON_ACCESS_ENABLED="${ADDON_ACCESS_ENABLED}" \
+    SCREENSHOT_ENABLED="${SCREENSHOT_ENABLED}" \
+    Z2M_URL="${Z2M_URL:-}" \
+    HA_ACCESS_TOKEN="${HA_ACCESS_TOKEN:-}" \
+    HA_API_BASE_URL="${HA_URL}/api" \
+    HA_WS_URL="${HA_WS_URL}" \
+        setsid node /usr/local/bin/generate-home-context.mjs \
+        >/tmp/home-context.log 2>&1 </dev/null &
+else
+    rm -f /data/context/home-briefing.md /data/context/decision-notes.md
+    log_info "Home context disabled - generated context files removed"
+fi
+
+# ==============================================================================
+# Inject custom OpenCode config.json (optional, for advanced users)
+# Standalone: read directly from the OPENCODE_CONFIG_JSON env var instead of
+# Supervisor's options.json.
+# ==============================================================================
+
+CONFIG_TARGET="/data/.config/opencode/config.json"
+
+if [ -n "${OPENCODE_CONFIG_JSON:-}" ]; then
+    if ! printf '%s' "${OPENCODE_CONFIG_JSON}" | jq -e . >/dev/null 2>&1; then
+        log_error "Invalid JSON in OPENCODE_CONFIG_JSON. Skipping custom config."
+        rm -f "${CONFIG_TARGET}"
+    else
+        printf '%s' "${OPENCODE_CONFIG_JSON}" > "${CONFIG_TARGET}"
+        log_info "Custom OpenCode config.json written from OPENCODE_CONFIG_JSON"
+    fi
+else
+    rm -f "${CONFIG_TARGET}"
+fi
+
+# ==============================================================================
+# User startup hooks (opt-in)
+# ==============================================================================
+
+if [ "${USER_HOOKS_ENABLED}" = "true" ]; then
+    {
+        log_warning "Startup hooks are enabled. Scripts in ${ADDON_STATE_DIR}/startup.d run as root on every start."
+        log_warning "They are your own code: nothing here checks, supervises or restarts them."
+
+        while IFS= read -r hook_line; do
+            [ -n "${hook_line}" ] && log_warning "  hook: ${hook_line}"
+        done < <(/usr/local/bin/opencode-run-hooks --manifest 2>/dev/null || true)
+
+        nice -n 10 setsid /usr/local/bin/opencode-run-hooks --boot \
+            >/tmp/user-hooks.log 2>&1 </dev/null &
+
+        log_info "Startup hooks started in the background - 'ha-hooks list' and 'ha-hooks log' show what happened"
+    } || true
+else
+    log_info "Startup hooks disabled"
+fi
+
+log_info "OpenCode initialization complete"

@@ -1,0 +1,100 @@
+---
+name: Standalone Image Checks
+
+# Mirrors stable-image-checks.yaml / beta-image-checks.yaml: build-only (no
+# push), native multi-arch matrix, gated on the paths that can actually break
+# the image. standalone/ has no Supervisor to build under, so unlike those
+# two this also boots the built image and checks its front door responds -
+# the boot sequence (s6-overlay, init-opencode, ttyd/MCP server startup) is
+# exactly what a build-only check can't catch.
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/standalone-image-checks.yaml"
+      - "standalone/**"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/standalone-image-checks.yaml"
+      - "standalone/**"
+  workflow_dispatch:
+
+concurrency:
+  group: standalone-image-checks-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Native ${{ matrix.arch }} image
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - arch: aarch64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build standalone image
+        uses: docker/build-push-action@v7
+        with:
+          context: standalone
+          file: standalone/Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: false
+          # Native runner for both legs, so loading the single-platform image
+          # into the local daemon is valid either way - only actually used
+          # below, on amd64.
+          load: true
+          tags: opencode-standalone:ci
+          build-args: |
+            BUILD_VERSION=ci
+            BUILD_ARCH=${{ matrix.arch }}
+          cache-from: type=gha,scope=standalone-check-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=standalone-check-${{ matrix.arch }}
+
+      - name: Boot smoke test
+        if: matrix.arch == 'amd64'
+        working-directory: standalone
+        run: |
+          mkdir -p ha-config
+          echo "default_config:" > ha-config/configuration.yaml
+
+          docker run -d --name opencode-ci \
+            -e HA_URL=http://homeassistant.local:8123 \
+            -e HA_ACCESS_TOKEN=ci-smoke-test-placeholder-token \
+            -e INTERFACE_MODE=terminal \
+            -v "$PWD/ha-config:/homeassistant" \
+            -p 8099:8099 \
+            opencode-standalone:ci
+
+          ok=0
+          for _ in $(seq 1 45); do
+            if curl -fsS --max-time 3 http://127.0.0.1:8099/ >/dev/null 2>&1; then
+              ok=1
+              break
+            fi
+            sleep 2
+          done
+
+          if [ "${ok}" != "1" ]; then
+            echo "::error::Front door never responded within 90s"
+          fi
+
+          echo "--- container logs ---"
+          docker logs opencode-ci
+
+          [ "${ok}" = "1" ]
+
+      - name: Clean up smoke test container
+        if: always() && matrix.arch == 'amd64'
+        run: docker rm -f opencode-ci 2>/dev/null || true

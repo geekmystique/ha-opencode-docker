@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# OpenCode (standalone) - Optional LAN Server Service (opencode attach)
+# ==============================================================================
+
+export HOME="/data"
+export XDG_DATA_HOME="/data/.local/share"
+export XDG_CONFIG_HOME="/data/.config"
+export NPM_CONFIG_PREFIX="/data/.npm-global"
+export NODE_OPTIONS="--max-old-space-size=512"
+
+if [ -f /data/.env_vars ]; then
+    source /data/.env_vars
+fi
+
+if [ -n "${HA_ACCESS_TOKEN:-}" ]; then
+    export HA_TOKEN="${HA_ACCESS_TOKEN}"
+fi
+
+export PATH="/usr/local/bin:/usr/bin:/bin:${PATH}"
+export OPENCODE_DISABLE_AUTOUPDATE=true
+
+ENABLE_SERVER="${ENABLE_SERVER:-false}"
+SERVER_PORT=4096
+
+if [ "${ENABLE_SERVER}" != "true" ]; then
+    exec sleep infinity
+fi
+
+echo "LAN server config: ENABLE_SERVER=${ENABLE_SERVER} INTERNAL_PORT=${SERVER_PORT}"
+echo "WARNING: LAN server mode is enabled. OpenCode will listen on 0.0.0.0:${SERVER_PORT} inside the container."
+echo "WARNING: only publish this port on trusted networks. Do not expose it to the internet."
+echo "Map ${SERVER_PORT}/tcp in docker-compose.yml, then connect with: opencode attach http://<host>:<mapped-port>"
+echo "If OpenCode prints http://0.0.0.0:${SERVER_PORT}, that is the internal container listener."
+
+# ==============================================================================
+# Optional browser CORS origins
+# ------------------------------------------------------------------------------
+# opencode serve only accepts browser origins via --cors <origin> (no
+# environment variable equivalent). Without it, browser-based clients that
+# talk to this server directly (e.g. a web/VS Code UI, as opposed to the
+# 'opencode attach' CLI) can be blocked by the browser's CORS policy. Empty by
+# default, so 'opencode attach' and other non-browser clients are unaffected.
+# CORS_ORIGINS is a comma-separated list (see standalone/.env.example).
+# ==============================================================================
+
+CORS_ARGS=()
+if [ -n "${CORS_ORIGINS:-}" ]; then
+    IFS=',' read -ra ORIGIN_LIST <<< "${CORS_ORIGINS}"
+    for ORIGIN in "${ORIGIN_LIST[@]}"; do
+        ORIGIN="$(echo "${ORIGIN}" | xargs)"
+        if [ -n "${ORIGIN}" ]; then
+            CORS_ARGS+=(--cors "${ORIGIN}")
+            echo "LAN server: allowing browser origin via CORS: ${ORIGIN}"
+        fi
+    done
+fi
+
+if [ "${#CORS_ARGS[@]}" -eq 0 ]; then
+    echo "LAN server: no CORS origins configured. Browser-based clients will be blocked; only non-browser clients such as 'opencode attach' are supported without this option."
+    echo "Starting OpenCode LAN server: opencode serve --hostname 0.0.0.0 --port ${SERVER_PORT}"
+else
+    echo "Starting OpenCode LAN server: opencode serve --hostname 0.0.0.0 --port ${SERVER_PORT} --cors <configured origin(s)>"
+fi
+
+cd /homeassistant
+if HEADLESS_PERMISSION_CONFIG=$(node /opt/ha-mcp-server/headless-permissions.mjs); then
+    export OPENCODE_CONFIG_CONTENT="${HEADLESS_PERMISSION_CONFIG}"
+    echo "LAN server: explicit edit allows are enabled; unmatched headless edit requests are denied."
+else
+    echo "WARNING: LAN server: could not prepare the headless permission policy; OpenCode's normal permission handling applies."
+fi
+exec opencode serve --hostname 0.0.0.0 --port "${SERVER_PORT}" "${CORS_ARGS[@]}"
