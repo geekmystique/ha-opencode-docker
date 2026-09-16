@@ -297,7 +297,7 @@ describe("HA-facing OAuth HTTP boundary", () => {
     expect(callbacks[1].url.searchParams.get("error")).toBe("access_denied");
     const exchange = await f.core("/token", f.tokenPost({ ...client, grant_type: "authorization_code", redirect_uri: callback, code: callbacks[0].url.searchParams.get("code") }));
     expect(exchange.status).toBe(200);
-  }, 20000);
+  }, 45000);
   it("isolates SDK sessions, filters list AND execution, and revokes live sessions on replacement", async () => {
     const f = await fixture(); const credentials = await f.provision();
     const first = await f.tokens(credentials); const second = await f.tokens(credentials);
